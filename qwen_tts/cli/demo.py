@@ -20,6 +20,9 @@ A gradio demo for Qwen3 TTS models.
 import argparse
 import os
 import tempfile
+import random
+import re
+import gc
 from dataclasses import asdict
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -57,6 +60,80 @@ def _dtype_from_str(s: str) -> torch.dtype:
 
 def _maybe(v):
     return v if v is not None else gr.update()
+
+
+def _set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+
+def _resolve_seed(seed) -> int:
+    try:
+        seed = int(seed)
+    except Exception:
+        seed = -1
+    if seed == -1:
+        seed = random.randint(0, 2147483647)
+    return seed
+
+
+def _chunk_text(text: str, max_chars: int = 200) -> List[str]:
+    text = (text or "").strip()
+    if not text:
+        return []
+    if len(text) <= max_chars:
+        return [text]
+    sentence_endings = re.compile(r"(?<=[.!?。！？])\s+")
+    sentences = sentence_endings.split(text)
+    chunks: List[str] = []
+    current = ""
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        if len(sentence) > max_chars:
+            if current:
+                chunks.append(current.strip())
+                current = ""
+            words = sentence.split()
+            for word in words:
+                if len(current) + len(word) + 1 <= max_chars:
+                    current = f"{current} {word}".strip()
+                else:
+                    if current:
+                        chunks.append(current.strip())
+                    current = word
+        else:
+            test = f"{current} {sentence}".strip() if current else sentence
+            if len(test) <= max_chars:
+                current = test
+            else:
+                if current:
+                    chunks.append(current.strip())
+                current = sentence
+    if current:
+        chunks.append(current.strip())
+    return chunks
+
+
+def _stitch_wavs(wavs: List[np.ndarray], sr: int, gap_seconds: float = 0.0) -> np.ndarray:
+    if not wavs:
+        return np.array([], dtype=np.float32)
+    if gap_seconds <= 0 or len(wavs) == 1:
+        return np.concatenate(wavs, axis=0)
+    gap = np.zeros(int(sr * gap_seconds), dtype=np.float32)
+    parts: List[np.ndarray] = []
+    for i, w in enumerate(wavs):
+        parts.append(np.asarray(w, dtype=np.float32))
+        if i < len(wavs) - 1:
+            parts.append(gap)
+    return np.concatenate(parts, axis=0)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -309,12 +386,18 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
                         lines=2,
                         placeholder="e.g. Say it in a very angry tone (例如：用特别伤心的语气说).",
                     )
+                    with gr.Accordion("More options (更多选项)", open=False):
+                        with gr.Row():
+                            seed_in = gr.Number(label="Seed (-1 = Auto)", value=-1, precision=0)
+                            chunk_size_in = gr.Slider(label="Chunk Size (chars)", minimum=50, maximum=500, value=200, step=10)
+                        with gr.Row():
+                            chunk_gap_in = gr.Slider(label="Chunk Gap (s)", minimum=0.0, maximum=3.0, value=0.0, step=0.01)
                     btn = gr.Button("Generate (生成)", variant="primary")
                 with gr.Column(scale=3):
                     audio_out = gr.Audio(label="Output Audio (合成结果)", type="numpy")
                     err = gr.Textbox(label="Status (状态)", lines=2)
 
-            def run_instruct(text: str, lang_disp: str, spk_disp: str, instruct: str):
+            def run_instruct(text: str, lang_disp: str, spk_disp: str, instruct: str, seed: int, chunk_size: int, chunk_gap: float):
                 try:
                     if not text or not text.strip():
                         return None, "Text is required (必须填写文本)."
@@ -322,19 +405,32 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
                         return None, "Speaker is required (必须选择说话人)."
                     language = lang_map.get(lang_disp, "Auto")
                     speaker = spk_map.get(spk_disp, spk_disp)
+                    seed = _resolve_seed(seed)
+                    chunks = _chunk_text(text.strip(), max_chars=int(chunk_size))
+                    if not chunks:
+                        return None, "Text is required (必须填写文本)."
                     kwargs = _gen_common_kwargs()
-                    wavs, sr = tts.generate_custom_voice(
-                        text=text.strip(),
-                        language=language,
-                        speaker=speaker,
-                        instruct=(instruct or "").strip() or None,
-                        **kwargs,
-                    )
-                    return _wav_to_gradio_audio(wavs[0], sr), "Finished. (生成完成)"
+                    wavs_all = []
+                    sr = None
+                    for chunk in chunks:
+                        _set_seed(seed)
+                        wavs, sr = tts.generate_custom_voice(
+                            text=chunk.strip(),
+                            language=language,
+                            speaker=speaker,
+                            instruct=(instruct or "").strip() or None,
+                            **kwargs,
+                        )
+                        wavs_all.append(wavs[0])
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        gc.collect()
+                    final_wav = _stitch_wavs(wavs_all, sr, gap_seconds=float(chunk_gap))
+                    return _wav_to_gradio_audio(final_wav, sr), f"Finished. (生成完成) Seed: {seed}"
                 except Exception as e:
                     return None, f"{type(e).__name__}: {e}"
 
-            btn.click(run_instruct, inputs=[text_in, lang_in, spk_in, instruct_in], outputs=[audio_out, err])
+            btn.click(run_instruct, inputs=[text_in, lang_in, spk_in, instruct_in, seed_in, chunk_size_in, chunk_gap_in], outputs=[audio_out, err])
 
         elif model_kind == "voice_design":
             with gr.Row():
@@ -356,30 +452,49 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
                         lines=3,
                         value="Speak in an incredulous tone, but with a hint of panic beginning to creep into your voice."
                     )
+                    with gr.Accordion("More options (更多选项)", open=False):
+                        with gr.Row():
+                            seed_in = gr.Number(label="Seed (-1 = Auto)", value=-1, precision=0)
+                            chunk_size_in = gr.Slider(label="Chunk Size (chars)", minimum=50, maximum=500, value=200, step=10)
+                        with gr.Row():
+                            chunk_gap_in = gr.Slider(label="Chunk Gap (s)", minimum=0.0, maximum=3.0, value=0.0, step=0.01)
                     btn = gr.Button("Generate (生成)", variant="primary")
                 with gr.Column(scale=3):
                     audio_out = gr.Audio(label="Output Audio (合成结果)", type="numpy")
                     err = gr.Textbox(label="Status (状态)", lines=2)
 
-            def run_voice_design(text: str, lang_disp: str, design: str):
+            def run_voice_design(text: str, lang_disp: str, design: str, seed: int, chunk_size: int, chunk_gap: float):
                 try:
                     if not text or not text.strip():
                         return None, "Text is required (必须填写文本)."
                     if not design or not design.strip():
                         return None, "Voice design instruction is required (必须填写音色描述)."
                     language = lang_map.get(lang_disp, "Auto")
+                    seed = _resolve_seed(seed)
+                    chunks = _chunk_text(text.strip(), max_chars=int(chunk_size))
+                    if not chunks:
+                        return None, "Text is required (必须填写文本)."
                     kwargs = _gen_common_kwargs()
-                    wavs, sr = tts.generate_voice_design(
-                        text=text.strip(),
-                        language=language,
-                        instruct=design.strip(),
-                        **kwargs,
-                    )
-                    return _wav_to_gradio_audio(wavs[0], sr), "Finished. (生成完成)"
+                    wavs_all = []
+                    sr = None
+                    for chunk in chunks:
+                        _set_seed(seed)
+                        wavs, sr = tts.generate_voice_design(
+                            text=chunk.strip(),
+                            language=language,
+                            instruct=design.strip(),
+                            **kwargs,
+                        )
+                        wavs_all.append(wavs[0])
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        gc.collect()
+                    final_wav = _stitch_wavs(wavs_all, sr, gap_seconds=float(chunk_gap))
+                    return _wav_to_gradio_audio(final_wav, sr), f"Finished. (生成完成) Seed: {seed}"
                 except Exception as e:
                     return None, f"{type(e).__name__}: {e}"
 
-            btn.click(run_voice_design, inputs=[text_in, lang_in, design_in], outputs=[audio_out, err])
+            btn.click(run_voice_design, inputs=[text_in, lang_in, design_in, seed_in, chunk_size_in, chunk_gap_in], outputs=[audio_out, err])
 
         else:  # voice_clone for base
             with gr.Tabs():
@@ -411,13 +526,19 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
                                 value="Auto",
                                 interactive=True,
                             )
+                            with gr.Accordion("More options (更多选项)", open=False):
+                                with gr.Row():
+                                    seed_in = gr.Number(label="Seed (-1 = Auto)", value=-1, precision=0)
+                                    chunk_size_in = gr.Slider(label="Chunk Size (chars)", minimum=50, maximum=500, value=200, step=10)
+                                with gr.Row():
+                                    chunk_gap_in = gr.Slider(label="Chunk Gap (s)", minimum=0.0, maximum=3.0, value=0.0, step=0.01)
                             btn = gr.Button("Generate (生成)", variant="primary")
 
                         with gr.Column(scale=3):
                             audio_out = gr.Audio(label="Output Audio (合成结果)", type="numpy")
                             err = gr.Textbox(label="Status (状态)", lines=2)
 
-                    def run_voice_clone(ref_aud, ref_txt: str, use_xvec: bool, text: str, lang_disp: str):
+                    def run_voice_clone(ref_aud, ref_txt: str, use_xvec: bool, text: str, lang_disp: str, seed: int, chunk_size: int, chunk_gap: float):
                         try:
                             if not text or not text.strip():
                                 return None, "Target text is required (必须填写待合成文本)."
@@ -430,22 +551,35 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
                                     "(未勾选 use x-vector only 时，必须提供参考音频文本；否则请勾选 use x-vector only，但效果会变差.)"
                                 )
                             language = lang_map.get(lang_disp, "Auto")
+                            seed = _resolve_seed(seed)
+                            chunks = _chunk_text(text.strip(), max_chars=int(chunk_size))
+                            if not chunks:
+                                return None, "Target text is required (必须填写待合成文本)."
                             kwargs = _gen_common_kwargs()
-                            wavs, sr = tts.generate_voice_clone(
-                                text=text.strip(),
-                                language=language,
-                                ref_audio=at,
-                                ref_text=(ref_txt.strip() if ref_txt else None),
-                                x_vector_only_mode=bool(use_xvec),
-                                **kwargs,
-                            )
-                            return _wav_to_gradio_audio(wavs[0], sr), "Finished. (生成完成)"
+                            wavs_all = []
+                            sr = None
+                            for chunk in chunks:
+                                _set_seed(seed)
+                                wavs, sr = tts.generate_voice_clone(
+                                    text=chunk.strip(),
+                                    language=language,
+                                    ref_audio=at,
+                                    ref_text=(ref_txt.strip() if ref_txt else None),
+                                    x_vector_only_mode=bool(use_xvec),
+                                    **kwargs,
+                                )
+                                wavs_all.append(wavs[0])
+                                if torch.cuda.is_available():
+                                    torch.cuda.empty_cache()
+                                gc.collect()
+                            final_wav = _stitch_wavs(wavs_all, sr, gap_seconds=float(chunk_gap))
+                            return _wav_to_gradio_audio(final_wav, sr), f"Finished. (生成完成) Seed: {seed}"
                         except Exception as e:
                             return None, f"{type(e).__name__}: {e}"
 
                     btn.click(
                         run_voice_clone,
-                        inputs=[ref_audio, ref_text, xvec_only, text_in, lang_in],
+                        inputs=[ref_audio, ref_text, xvec_only, text_in, lang_in, seed_in, chunk_size_in, chunk_gap_in],
                         outputs=[audio_out, err],
                     )
 
@@ -492,6 +626,12 @@ Upload a previously saved voice file, then synthesize new text.
                                 value="Auto",
                                 interactive=True,
                             )
+                            with gr.Accordion("More options (更多选项)", open=False):
+                                with gr.Row():
+                                    seed_in2 = gr.Number(label="Seed (-1 = Auto)", value=-1, precision=0)
+                                    chunk_size_in2 = gr.Slider(label="Chunk Size (chars)", minimum=50, maximum=500, value=200, step=10)
+                                with gr.Row():
+                                    chunk_gap_in2 = gr.Slider(label="Chunk Gap (s)", minimum=0.0, maximum=3.0, value=0.0, step=0.01)
                             gen_btn2 = gr.Button("Generate (生成)", variant="primary")
 
                         with gr.Column(scale=3):
@@ -523,7 +663,7 @@ Upload a previously saved voice file, then synthesize new text.
                         except Exception as e:
                             return None, f"{type(e).__name__}: {e}"
 
-                    def load_prompt_and_gen(file_obj, text: str, lang_disp: str):
+                    def load_prompt_and_gen(file_obj, text: str, lang_disp: str, seed: int, chunk_size: int, chunk_gap: float):
                         try:
                             if file_obj is None:
                                 return None, "Voice file is required (必须上传音色文件)."
@@ -563,14 +703,27 @@ Upload a previously saved voice file, then synthesize new text.
                                 )
 
                             language = lang_map.get(lang_disp, "Auto")
+                            seed = _resolve_seed(seed)
+                            chunks = _chunk_text(text.strip(), max_chars=int(chunk_size))
+                            if not chunks:
+                                return None, "Target text is required (必须填写待合成文本)."
                             kwargs = _gen_common_kwargs()
-                            wavs, sr = tts.generate_voice_clone(
-                                text=text.strip(),
-                                language=language,
-                                voice_clone_prompt=items,
-                                **kwargs,
-                            )
-                            return _wav_to_gradio_audio(wavs[0], sr), "Finished. (生成完成)"
+                            wavs_all = []
+                            sr = None
+                            for chunk in chunks:
+                                _set_seed(seed)
+                                wavs, sr = tts.generate_voice_clone(
+                                    text=chunk.strip(),
+                                    language=language,
+                                    voice_clone_prompt=items,
+                                    **kwargs,
+                                )
+                                wavs_all.append(wavs[0])
+                                if torch.cuda.is_available():
+                                    torch.cuda.empty_cache()
+                                gc.collect()
+                            final_wav = _stitch_wavs(wavs_all, sr, gap_seconds=float(chunk_gap))
+                            return _wav_to_gradio_audio(final_wav, sr), f"Finished. (生成完成) Seed: {seed}"
                         except Exception as e:
                             return None, (
                                 f"Failed to read or use voice file. Check file format/content.\n"
@@ -579,7 +732,7 @@ Upload a previously saved voice file, then synthesize new text.
                             )
 
                     save_btn.click(save_prompt, inputs=[ref_audio_s, ref_text_s, xvec_only_s], outputs=[prompt_file_out, err2])
-                    gen_btn2.click(load_prompt_and_gen, inputs=[prompt_file_in, text_in2, lang_in2], outputs=[audio_out2, err2])
+                    gen_btn2.click(load_prompt_and_gen, inputs=[prompt_file_in, text_in2, lang_in2, seed_in2, chunk_size_in2, chunk_gap_in2], outputs=[audio_out2, err2])
 
         gr.Markdown(
             """
